@@ -1,0 +1,333 @@
+import os
+import argparse
+import random
+import numpy as np
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+
+
+# Dropout broke in PyTorch 1.11
+if tuple(map(int, torch.__version__.split(".")[:2])) == (1, 11):
+    print("WARNING: Dropout is bugged in PyTorch 1.11. Results may be worse.")
+    dropout_fn = nn.Dropout
+elif tuple(map(int, torch.__version__.split(".")[:2])) >= (1, 12):
+    dropout_fn = nn.Dropout1d
+else:
+    dropout_fn = nn.Dropout2d
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+class NPZTimeSeriesDataset(torch.utils.data.Dataset):
+    def __init__(self, npz_path: str, split: str):
+        super().__init__()
+        data = np.load(npz_path, allow_pickle=True)
+        x_key = f"x_{split}"
+        y_key = f"y_{split}"
+        if x_key not in data or y_key not in data:
+            raise KeyError(f"Missing {x_key}/{y_key} in {npz_path}")
+
+        self.x = data[x_key].astype(np.float32)   # (N, L, 1)
+        self.y = data[y_key].astype(np.float32)   # (N, d_out)
+
+        if not (self.x.ndim == 3):
+            raise ValueError(f"Expected x shape (N,L,1), got {self.x.shape}")
+
+        # Accept (N,) or (N, d_out); convert (N,) -> (N,1)
+        if self.y.ndim == 1:
+            self.y = self.y[:, None]
+        if self.y.ndim != 2:
+            raise ValueError(f"Expected y shape (N,) or (N,d_out), got {self.y.shape}")
+
+    @property
+    def d_output(self) -> int:
+        return int(self.y.shape[1])
+
+    def __len__(self):
+        return self.x.shape[0]
+
+    def __getitem__(self, idx):
+        # x: (L, 1), y: (d_output,)
+        x = torch.from_numpy(self.x[idx])
+        y = torch.from_numpy(self.y[idx])
+        return x, y
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, dropout=0.1, nhead=8, dim_feedforward=None):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = 4 * d_model
+
+        self.block = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,   # IMPORTANT: expects (B, L, D)
+            norm_first=False,   # keep outer residual/norm structure similar to your current code
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class TRRegressor(nn.Module):
+    def __init__(
+        self,
+        d_input=1,
+        d_output=1,
+        d_model=128,
+        n_layers=4,
+        dropout=0.1,
+        prenorm=False,
+        nhead=8,
+        dim_feedforward=None,
+    ):
+        super().__init__()
+        self.prenorm = prenorm
+
+        self.encoder = nn.Linear(d_input, d_model)
+
+        self.tr_layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+        for _ in range(n_layers):
+            selftr_layers.append(
+                TransformerBlock(
+                    d_model=d_model,
+                    dropout=dropout,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                )
+            )
+            self.norms.append(nn.LayerNorm(d_model))
+            self.dropouts.append(nn.Identity())
+
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_output),
+        )
+
+    def forward(self, x):
+        # x: (B, L, 1)
+        x = self.encoder(x)              # (B, L, d_model)
+
+        for layer, norm, dropout in zip(self.tr_layers, self.norms, self.dropouts):
+            z = x
+            if self.prenorm:
+                z = norm(z)
+
+            z = layer(z)                 # still (B, L, d_model)
+            z = dropout(z)
+            x = x + z
+
+            if not self.prenorm:
+                x = norm(x)
+
+        x = x.mean(dim=1)                # (B, d_model)
+        y = self.decoder(x)              # (B, d_output)
+        return y
+
+
+def setup_optimizer(model, lr, weight_decay, epochs):
+    all_parameters = list(model.parameters())
+    general_params = [p for p in all_parameters if not hasattr(p, "_optim")]
+    optimizer = optim.AdamW(general_params, lr=lr, weight_decay=weight_decay)
+
+    hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
+    unique_hps = [dict(s) for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))]
+    for hp in unique_hps:
+        params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
+        optimizer.add_param_group({"params": params, **hp})
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    return optimizer, scheduler
+
+
+@torch.no_grad()
+def evaluate(model, dataloader, device):
+    model.eval()
+    sse = 0.0
+    sae = 0.0
+    n = 0
+    for x, y in dataloader:
+        x = x.to(device)
+        y = y.to(device)
+        pred = model(x)
+        err = pred - y
+        sse += torch.sum(err * err).item()
+        sae += torch.sum(torch.abs(err)).item()
+        n += y.numel()
+    rmse = (sse / max(n, 1)) ** 0.5
+    mae = sae / max(n, 1)
+    return mae, rmse
+
+
+def main():
+    # Data
+    p.add_argument("--data", type=str, required=True, help="Path to data")
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=64)
+
+    # Model
+    p.add_argument("--n_layers", type=int, default=4)
+    p.add_argument("--d_model", type=int, default=128)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--prenorm", action="store_true")
+    p.add_argument("--d_input", type=int, default=16)
+
+    # Optimization
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=0.00)
+    p.add_argument("--epochs", type=int, default=3)
+
+    # Checkpointing
+    p.add_argument("--ckpt_dir", type=str, default="checkpoint_vdp")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--seed", type=int, default=37)
+    p.add_argument("--nhead", type=int, default=8)
+    p.add_argument("--dim_feedforward", type=int, default=512)
+
+    args = p.parse_args()
+    set_seed(args.seed)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        cudnn.benchmark = True
+
+    # Data
+    trainset = NPZTimeSeriesDataset(args.data, "train")
+    valset = NPZTimeSeriesDataset(args.data, "val")
+    testset = NPZTimeSeriesDataset(args.data, "test")
+    
+    d_output = trainset.d_output
+    print(f"Inferred d_output = {d_output} from dataset labels.")
+
+
+    trainloader = torch.utils.data.DataLoader(
+        trainset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=(device == "cuda")
+    )
+    valloader = torch.utils.data.DataLoader(
+        valset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=(device == "cuda")
+    )
+    testloader = torch.utils.data.DataLoader(
+        testset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=(device == "cuda")
+    )
+
+    # Model
+    model = TRRegressor(
+        d_input=args.d_input,
+        d_output=d_output,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        dropout=args.dropout,
+        prenorm=args.prenorm,
+        nhead=args.nhead,
+        dim_feedforward=args.dim_feedforward,
+    ).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer, scheduler = setup_optimizer(model, lr=args.lr, weight_decay=args.weight_decay, epochs=args.epochs)
+
+    # Checkpoint paths
+    ckpt_dir = args.ckpt_dir
+    os.makedirs(ckpt_dir, exist_ok=True)
+    best_path = os.path.join(ckpt_dir, "best.pt")
+    last_path = os.path.join(ckpt_dir, "last.pt")
+
+    best_val_rmse = float("inf")
+    start_epoch = 0
+
+    if args.resume and os.path.exists(last_path):
+        ckpt = torch.load(last_path, map_location="cpu")
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optim"])
+        scheduler.load_state_dict(ckpt["sched"])
+        best_val_rmse = ckpt.get("best_val_rmse", best_val_rmse)
+        start_epoch = int(ckpt["epoch"]) + 1
+        print(f"Resumed from {last_path} at epoch {start_epoch} (best val RMSE {best_val_rmse:.6f}).")
+
+    # Train
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running = 0.0
+        n_seen = 0
+
+        pbar = tqdm(trainloader, desc=f"Epoch {epoch}/{args.epochs-1}")
+        for x, y in pbar:
+            x = x.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(x)
+            loss = criterion(pred, y)
+            loss.backward()
+            optimizer.step()
+
+            running += loss.item() * y.numel()
+            n_seen += y.numel()
+            pbar.set_postfix(train_mse=running / max(n_seen, 1))
+
+        scheduler.step()
+
+        val_mae, val_rmse = evaluate(model, valloader, device)
+        test_mae, test_rmse = evaluate(model, testloader, device)
+        print(f"[Epoch {epoch}] val MAE {val_mae:.6f} | val RMSE {val_rmse:.6f} || test MAE {test_mae:.6f} | test RMSE {test_rmse:.6f}")
+
+        # Save last
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optim": optimizer.state_dict(),
+                "sched": scheduler.state_dict(),
+                "best_val_rmse": best_val_rmse,
+                "args": vars(args),
+            },
+            last_path,
+        )
+
+        # Save best
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "best_val_rmse": best_val_rmse,
+                    "args": vars(args),
+                },
+                best_path,
+            )
+            print(f"  ✓ New best checkpoint saved (val RMSE {best_val_rmse:.6f}) to {best_path}")
+
+    # Evaluate best
+    if os.path.exists(best_path):
+        best = torch.load(best_path, map_location="cpu")
+        model.load_state_dict(best["model"])
+        model.to(device)
+        val_mae, val_rmse = evaluate(model, valloader, device)
+        test_mae, test_rmse = evaluate(model, testloader, device)
+        print(f"[Best] val MAE {val_mae:.6f} | val RMSE {val_rmse:.6f} || test MAE {test_mae:.6f} | test RMSE {test_rmse:.6f}")
+
+
+if __name__ == "__main__":
+    main()
